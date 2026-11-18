@@ -60,7 +60,10 @@ class CursorTablas(DictCursor):
             mapa = {}
             for r in self.fetchall():
                 nombre = list(r.values())[0]
-                mapa.setdefault(nombre.upper(), nombre)
+                # si hay doble (ENARMA01 viejo y enarma01), gana la minúscula: es la que
+                # llena la sincronizada desde Windows
+                if nombre.upper() not in mapa or nombre == nombre.lower():
+                    mapa[nombre.upper()] = nombre
             con._mapa_tablas = mapa
         if isinstance(query, str):
             query = _TABLA.sub(lambda m: mapa.get(m.group(0).upper(), m.group(0)), query)
