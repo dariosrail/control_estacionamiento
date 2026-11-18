@@ -3,7 +3,7 @@
 ESTACIONAMIENTO EN EL CELULAR - datos (sin pantalla).
 
 Lee la MISMA base del estacionamiento (solo consulta, no graba nada):
-  ENARMA01  entradas y cobros   status '0' = adentro · '2' = cobrado
+  enarma01  entradas y cobros   status '0' = adentro · '2' = cobrado
   ENARTA01  tarifas             '0000' normal (hora, fraccion, dia, mediodia) · 'HT1' hotel
   ENARDI01  día y turno abiertos (dia = '1900-01-01')
 
@@ -45,7 +45,7 @@ def ahora(zona=None):
 # ─────────────────────────────────────────────────────────────
 #  MAYÚSCULAS / MINÚSCULAS
 #  MySQL en Windows guarda las tablas en minúsculas (enarma01) y la sincronizada en Railway
-#  (Linux) sí distingue: ENARMA01 ≠ enarma01. Este cursor busca cómo se llama de verdad
+#  (Linux) sí distingue: enarma01 ≠ enarma01. Este cursor busca cómo se llama de verdad
 #  cada tabla en esa base y cambia el nombre en la consulta, venga como venga.
 # ─────────────────────────────────────────────────────────────
 _TABLA = re.compile(r"\b(?:ENAR[A-Z]{2}\d{2}|ESTAC_EMPRESAS)\b", re.IGNORECASE)
@@ -60,7 +60,7 @@ class CursorTablas(DictCursor):
             mapa = {}
             for r in self.fetchall():
                 nombre = list(r.values())[0]
-                # si hay doble (ENARMA01 y enarma01 vieja), gana la MAYÚSCULA: es la que
+                # si hay doble (enarma01 y enarma01 vieja), gana la MAYÚSCULA: es la que
                 # llena la sincronizada; la otra solo se usa si es la única que hay
                 if nombre.upper() not in mapa or nombre == nombre.upper():
                     mapa[nombre.upper()] = nombre
@@ -193,11 +193,11 @@ def probar_empresa(e):
         return False, f"No conecta: {ex}"
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) n FROM ENARMA01 WHERE status='0'")
+            cur.execute("SELECT COUNT(*) n FROM enarma01 WHERE status='0'")
             n = cur.fetchone()["n"]
         return True, f"Conecta bien · {n} vehículos adentro"
     except Exception as ex:
-        return False, f"Conecta, pero no encuentro ENARMA01 (¿ya sincronizó?): {ex}"
+        return False, f"Conecta, pero no encuentro enarma01 (¿ya sincronizó?): {ex}"
     finally:
         conn.close()
 
@@ -342,7 +342,7 @@ def sesion_actual(cur):
 
 def adentro(cur, tarifas):
     cur.execute("""SELECT id, serie, folio, placas, fechae, turno, tipo_servicio, observaciones
-                   FROM ENARMA01 WHERE status = '0' ORDER BY fechae""")
+                   FROM enarma01 WHERE status = '0' ORDER BY fechae""")
     momento = ahora()
     res = []
     for r in cur.fetchall():
@@ -357,10 +357,10 @@ def cobrados(cur, desde=None, hasta=None, turno=None):
     campos = ("id, serie, folio, placas, tipo_servicio, observaciones, importe, efectivo, tarjeta, "
               "transferencia, fechae, fechas, horas, tiempo, turno, cajero")
     if turno:
-        cur.execute(f"SELECT {campos} FROM ENARMA01 WHERE status = '2' AND turno = %s "
+        cur.execute(f"SELECT {campos} FROM enarma01 WHERE status = '2' AND turno = %s "
                     "ORDER BY fechas DESC, id DESC", (turno,))
     else:
-        cur.execute(f"SELECT {campos} FROM ENARMA01 WHERE status = '2' AND fechas >= %s AND fechas < %s "
+        cur.execute(f"SELECT {campos} FROM enarma01 WHERE status = '2' AND fechas >= %s AND fechas < %s "
                     "ORDER BY fechas DESC, id DESC",
                     (datetime(desde.year, desde.month, desde.day),
                      datetime(hasta.year, hasta.month, hasta.day) + timedelta(days=1)))
