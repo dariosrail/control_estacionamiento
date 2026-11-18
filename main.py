@@ -51,7 +51,8 @@ def main(page: ft.Page):
     page.theme = ft.Theme(color_scheme_seed=AZUL)
 
     estado = {"modo": "hoy", "desde": dat.ahora().date(), "hasta": dat.ahora().date(),
-              "datos": None, "vivo": True, "ocupado": False, "hilo": False,
+              "datos": None, "vivo": True, "ocupado": False, "hilo": False, "conectado": True,
+              "ultimo_ok": time.time(),
               "empresa": None, "admin": False, "opciones": []}
 
     def aviso(texto, error=False):
@@ -194,22 +195,37 @@ def main(page: ft.Page):
         lb_hora.value = f"Actualizado {d['hora']:%H:%M:%S}"
         page.update()
 
-    def cargar(e=None):
-        if estado["ocupado"]:
+    candado = threading.Lock()
+
+    def _actualizar_pantalla():
+        try:
+            page.update()
+            estado["ultimo_ok"] = time.time()
+        except Exception as ex:               # la pantalla se desconectó: no importa, se reintenta luego
+            print(f"[cel] page.update falló: {ex}", flush=True)
+
+    def cargar(e=None, auto=False):
+        # el refresco automático se salta si ya hay una carga; lo demás (↻, periodo) espera hasta 20 s
+        if not (candado.acquire(blocking=False) if auto else candado.acquire(timeout=20)):
             return
         estado["ocupado"] = True
-        barra.visible = True
-        page.update()
         try:
+            barra.visible = True
+            _actualizar_pantalla()
             estado["datos"] = dat.consultar(estado["modo"], estado["desde"], estado["hasta"],
                                             estado["empresa"])
             pintar()
         except Exception as ex:
-            aviso(f"No pude leer la base: {ex}", True)
+            print(f"[cel] no pude leer la base: {ex}", flush=True)
+            try:
+                aviso(f"No pude leer la base: {ex}", True)
+            except Exception:
+                pass
         finally:
-            estado["ocupado"] = False
             barra.visible = False
-            page.update()
+            estado["ocupado"] = False
+            candado.release()
+            _actualizar_pantalla()
 
     # ───────────────────────── periodo ─────────────────────────
     def elegir_fecha(cual):
@@ -285,21 +301,35 @@ def main(page: ft.Page):
         cargar()
 
         def refresco():                       # cada 30 s (el tiempo de los que están adentro avanza)
+            # No depende de avisos de conexión/desconexión (Flet web no siempre los manda):
+            # siempre intenta; si la pantalla lleva 2 horas sin responder, la sesión ya murió.
             while estado["vivo"]:
                 time.sleep(CADA_SEGUNDOS)
-                if estado["vivo"] and not estado["ocupado"] and estado["datos"] is not None:
-                    try:
-                        cargar()
-                    except Exception:
-                        pass
+                if estado["datos"] is None:
+                    continue
+                if time.time() - estado["ultimo_ok"] > 7200:
+                    print("[cel] sesión sin respuesta 2 h: se apaga su refresco", flush=True)
+                    break
+                try:
+                    cargar(auto=True)
+                except Exception as ex:
+                    print(f"[cel] refresco: {ex}", flush=True)
         if not estado["hilo"]:
             estado["hilo"] = True
             threading.Thread(target=refresco, daemon=True).start()
 
-    def al_cerrar(e):
-        estado["vivo"] = False
+    # Si el cel bloquea la pantalla o cambias de pestaña, se desconecta un rato: el refresco
+    # se pausa y al volver se actualiza de inmediato. Solo se apaga cuando la sesión se cierra.
+    def al_desconectar(e):
+        estado["conectado"] = False
 
-    page.on_disconnect = al_cerrar
+    def al_reconectar(e):
+        estado["conectado"] = True
+        if estado["datos"] is not None:
+            threading.Thread(target=cargar, kwargs={"auto": True}, daemon=True).start()
+
+    page.on_disconnect = al_desconectar
+    page.on_connect = al_reconectar
 
     def pantalla(contenido, ancho=340):
         estado["datos"] = None                 # que el refresco no pinte encima
