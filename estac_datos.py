@@ -1,435 +1,521 @@
 # -*- coding: utf-8 -*-
 """
-ESTACIONAMIENTO EN EL CELULAR - datos (sin pantalla).
+ESTACIONAMIENTO EN EL CELULAR (Flet web) - solo consulta.
 
-Lee la MISMA base del estacionamiento (solo consulta, no graba nada):
-  enarma01  entradas y cobros   status '0' = adentro · '2' = cobrado
-  ENARTA01  tarifas             '0000' normal (hora, fraccion, dia, mediodia) · 'HT1' hotel
-  ENARDI01  día y turno abiertos (dia = '1900-01-01')
+Una sola pantalla:
+  * Tarjetas arriba: total de caja, efectivo, tarjeta, transferencia, autos adentro
+    (con lo que llevan acumulado), convenio hotel y pensionados.
+  * Pestañas: 🚗 Adentro · ✅ Cobrados · 📊 Resumen.
+  * Periodo: Hoy, Ayer, Turno abierto o un rango de fechas (histórico).
+  * Buscador por placa. Se actualiza solo cada 30 segundos.
 
-Los importes de los que están adentro se calculan IGUAL que estac_entra_sali_hotel.py
-(normal, medio día, día completo, restaurante, hotel y pensionado).
-El resumen de caja sigue a estac_movimientos_hotel.py: HOTEL (convenio) y PENSIONADOS
-no suman a caja.
+Varias empresas: la tabla ESTAC_EMPRESAS (en la base de control) guarda a qué base
+sincronizada se conecta cada estacionamiento y con qué usuario/clave entra su dueño.
+El administrador (APP_USUARIO / APP_CLAVE) ve todas, las da de alta y cambia entre ellas.
+
+Corre en Railway (ver LEEME.md). Variables:
+  MYSQL_URL     base de control (o DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
+  APP_USUARIO   usuario ADMINISTRADOR
+  APP_CLAVE     contraseña del administrador (si no hay empresas y no pones clave, entra directo)
+  NEGOCIO       nombre que sale arriba     (opcional)
+  TZ_NEGOCIO    zona horaria               (opcional, America/Merida)
 """
-import contextvars
 import os
-import re
-from datetime import date, datetime, timedelta
-from urllib.parse import unquote, urlparse
-from zoneinfo import ZoneInfo
+import threading
+import time
+from datetime import datetime
 
-import pymysql
-from pymysql.cursors import DictCursor
+import flet as ft
 
-# El servidor de Railway trabaja en UTC: la hora se toma de la zona del negocio
-ZONA = ZoneInfo(os.getenv("TZ_NEGOCIO", "America/Merida"))
-_zona = contextvars.ContextVar("zona", default=ZONA)     # la de la empresa que se consulta
+import estac_datos as dat
 
+NEGOCIO = os.getenv("NEGOCIO", "Estacionamiento")
+APP_USUARIO = os.getenv("APP_USUARIO", "admin")
+APP_CLAVE = os.getenv("APP_CLAVE", "")
+CADA_SEGUNDOS = 30
 
-def zona_de(nombre):
-    try:
-        return ZoneInfo(nombre) if nombre else ZONA
-    except Exception:
-        return ZONA
+AZUL, VERDE, NARANJA, MORADO, GRIS = "#1A237E", "#2E7D32", "#E65100", "#6A1B9A", "#546E7A"
+COLOR_TIPO = {"NORMAL": "#1565C0", "MEDIO DÍA": "#00838F", "DÍA 24 H": "#00695C", "RESTAURANTE": "#AD1457",
+              "HOTEL": "#8D6E00", "PENSIONADO": "#4527A0", "BAÑO": "#5D4037", "SERVICIO": "#455A64"}
 
 
-def ahora(zona=None):
-    """Hora local del estacionamiento (sin zona, igual que las fechas que graba la PC)."""
-    return datetime.now(zona_de(zona) if zona else _zona.get()).replace(tzinfo=None)
+def dinero(v):
+    return f"$ {float(v or 0):,.2f}"
 
 
-# ─────────────────────────────────────────────────────────────
-#  CONEXIÓN (variables de Railway)
-# ─────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────
-#  MAYÚSCULAS / MINÚSCULAS
-#  MySQL en Windows guarda las tablas en minúsculas (enarma01) y la sincronizada en Railway
-#  (Linux) sí distingue: enarma01 ≠ enarma01. Este cursor busca cómo se llama de verdad
-#  cada tabla en esa base y cambia el nombre en la consulta, venga como venga.
-# ─────────────────────────────────────────────────────────────
-_TABLA = re.compile(r"\b(?:ENAR[A-Z]{2}\d{2}|ESTAC_EMPRESAS)\b", re.IGNORECASE)
+def main(page: ft.Page):
+    page.title = NEGOCIO
+    page.theme_mode = ft.ThemeMode.LIGHT
+    page.bgcolor = "#ECEFF1"
+    page.padding = 0
+    page.theme = ft.Theme(color_scheme_seed=AZUL)
 
+    estado = {"modo": "hoy", "desde": dat.ahora().date(), "hasta": dat.ahora().date(),
+              "datos": None, "vivo": True, "ocupado": False, "hilo": False, "conectado": True,
+              "empresa": None, "admin": False, "opciones": []}
 
-class CursorTablas(DictCursor):
-    def execute(self, query, args=None):
-        con = self.connection
-        mapa = getattr(con, "_mapa_tablas", None)
-        if mapa is None:
-            super().execute("SHOW TABLES")
-            mapa = {}
-            for r in self.fetchall():
-                nombre = list(r.values())[0]
-                # si hay doble (enarma01 y enarma01 vieja), gana la MAYÚSCULA: es la que
-                # llena la sincronizada; la otra solo se usa si es la única que hay
-                if nombre.upper() not in mapa or nombre == nombre.upper():
-                    mapa[nombre.upper()] = nombre
-            con._mapa_tablas = mapa
-        if isinstance(query, str):
-            query = _TABLA.sub(lambda m: mapa.get(m.group(0).upper(), m.group(0)), query)
-            if query.lstrip().upper().startswith("CREATE TABLE"):
-                con._mapa_tablas = None            # que vuelva a leer los nombres
-        return super().execute(query, args)
+    def aviso(texto, error=False):
+        page.open(ft.SnackBar(ft.Text(texto), bgcolor="#B71C1C" if error else None))
 
+    # ───────────────────────── tarjetas ─────────────────────────
+    def tarjeta(titulo, valor, sub="", color=AZUL, col=6):
+        return ft.Container(
+            col={"xs": col, "sm": 3},
+            bgcolor="white", border_radius=12, padding=12,
+            border=ft.border.only(left=ft.BorderSide(5, color)),
+            content=ft.Column([
+                ft.Text(titulo, size=12, color=GRIS, weight=ft.FontWeight.W_600),
+                ft.Text(valor, size=20, weight=ft.FontWeight.BOLD, color=color),
+                ft.Text(sub, size=11, color=GRIS) if sub else ft.Container(height=0),
+            ], spacing=2))
 
-def config_mysql():
-    """MYSQL_URL / DATABASE_URL (mysql://usuario:clave@host:puerto/base) o DB_HOST, DB_PORT,
-    DB_USER, DB_PASSWORD, DB_NAME. En Railway: MYSQL_URL = ${{MySQL.MYSQL_URL}}."""
-    url = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL") or ""
-    if url:
-        u = urlparse(url)
-        datos = dict(host=u.hostname, port=u.port or 3306, user=unquote(u.username or ""),
-                     password=unquote(u.password or ""), database=(u.path or "/").lstrip("/"))
-    else:
-        datos = dict(host=os.getenv("DB_HOST", ""), port=int(os.getenv("DB_PORT", "3306") or 3306),
-                     user=os.getenv("DB_USER", ""), password=os.getenv("DB_PASSWORD", ""),
-                     database=os.getenv("DB_NAME", ""))
-    if not datos["host"] or not datos["database"]:
-        raise RuntimeError("Falta la conexión: pon MYSQL_URL (o DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) "
-                           "en las variables de Railway.")
-    return dict(datos, charset="utf8mb4", cursorclass=CursorTablas, autocommit=True,
-                connect_timeout=10, read_timeout=30)
+    fila_tarjetas = ft.ResponsiveRow(spacing=8, run_spacing=8)
 
+    # ───────────────────────── renglones ─────────────────────────
+    def chip(tipo):
+        return ft.Container(ft.Text(tipo, size=11, color="white", weight=ft.FontWeight.BOLD),
+                            bgcolor=COLOR_TIPO.get(tipo, GRIS), border_radius=10,
+                            padding=ft.padding.symmetric(vertical=2, horizontal=8))
 
-def conectar(cfg=None):
-    return pymysql.connect(**(cfg or config_mysql()))
+    def renglon_adentro(x):
+        entrada = dat.a_datetime(x.get("fechae"))
+        return ft.Container(
+            bgcolor="white", border_radius=10, padding=10,
+            content=ft.Row([
+                ft.Column([
+                    ft.Row([ft.Text(str(x.get("placas") or ""), size=17, weight=ft.FontWeight.BOLD),
+                            chip(x["tipo"])], spacing=8, wrap=True),
+                    ft.Text(f"Entró {entrada:%d/%m %H:%M}" if entrada else "", size=12, color=GRIS),
+                    ft.Text(f"⏱ {x['tiempo']}   ·   {x['folio_txt']}", size=12, color=GRIS),
+                ], spacing=2, expand=True),
+                ft.Column([ft.Text(dinero(x["importe"]), size=17, weight=ft.FontWeight.BOLD, color=NARANJA),
+                           ft.Text("lleva", size=11, color=GRIS)],
+                          horizontal_alignment=ft.CrossAxisAlignment.END, spacing=0),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER))
 
+    def renglon_cobrado(x):
+        sale = dat.a_datetime(x.get("fechas"))
+        formas = [(n, dat.num(x.get(k))) for n, k in (("Efe", "efectivo"), ("Tar", "tarjeta"),
+                                                      ("Tra", "transferencia"))]
+        pago = " · ".join(f"{n} {dinero(v)}" for n, v in formas if v) or (
+            "Convenio" if x["tipo"] == "HOTEL" else "Sin cobro" if x["tipo"] == "PENSIONADO" else "")
+        return ft.Container(
+            bgcolor="white", border_radius=10, padding=10,
+            content=ft.Row([
+                ft.Column([
+                    ft.Row([ft.Text(str(x.get("placas") or ""), size=16, weight=ft.FontWeight.BOLD),
+                            chip(x["tipo"])], spacing=8, wrap=True),
+                    ft.Text((f"Salió {sale:%d/%m %H:%M}" if sale else "") + f"   ·   ⏱ {x.get('tiempo') or '--'}",
+                            size=12, color=GRIS),
+                    ft.Text(pago, size=12, color=GRIS),
+                ], spacing=2, expand=True),
+                ft.Text(dinero(x.get("importe")), size=16, weight=ft.FontWeight.BOLD,
+                        color=VERDE if x["tipo"] not in ("HOTEL", "PENSIONADO") else GRIS),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER))
 
-# ─────────────────────────────────────────────────────────────
-#  EMPRESAS (varios estacionamientos con la misma app)
-#  La tabla ESTAC_EMPRESAS vive en la base de control (la de las variables de Railway).
-#  Cada renglón dice a qué base sincronizada se conecta esa empresa:
-#    host vacío  → mismo servidor de control, solo cambia la base (varias bases en un MySQL)
-#    host lleno  → otro servidor (otro MySQL de Railway, por ejemplo)
-#  Si la tabla está vacía, la app trabaja como antes: con la base de control.
-# ─────────────────────────────────────────────────────────────
-SQL_EMPRESAS = """
-CREATE TABLE IF NOT EXISTS ESTAC_EMPRESAS (
-    id           INT AUTO_INCREMENT PRIMARY KEY,
-    clave        VARCHAR(20)  NOT NULL UNIQUE,
-    nombre       VARCHAR(80)  NOT NULL,
-    host         VARCHAR(120) NOT NULL DEFAULT '',
-    puerto       INT          NOT NULL DEFAULT 3306,
-    usuario_db   VARCHAR(60)  NOT NULL DEFAULT '',
-    clave_db     VARCHAR(120) NOT NULL DEFAULT '',
-    base         VARCHAR(64)  NOT NULL DEFAULT '',
-    usuario_app  VARCHAR(40)  NOT NULL DEFAULT '',
-    clave_app    VARCHAR(60)  NOT NULL DEFAULT '',
-    zona         VARCHAR(40)  NOT NULL DEFAULT 'America/Merida',
-    activo       CHAR(1)      NOT NULL DEFAULT '1',
-    creado       DATETIME     DEFAULT CURRENT_TIMESTAMP
-) DEFAULT CHARSET=utf8mb4
-"""
-CAMPOS_EMPRESA = ("clave", "nombre", "host", "puerto", "usuario_db", "clave_db", "base",
-                  "usuario_app", "clave_app", "zona", "activo")
+    lista_adentro = ft.ListView(expand=True, spacing=6, padding=10)
+    lista_cobrados = ft.ListView(expand=True, spacing=6, padding=10)
+    vista_resumen = ft.ListView(expand=True, spacing=8, padding=10)
 
+    buscar = ft.TextField(hint_text="Buscar placa…", prefix_icon=ft.Icons.SEARCH, dense=True,
+                          bgcolor="white", border_radius=10, expand=True,
+                          capitalization=ft.TextCapitalization.CHARACTERS,
+                          on_change=lambda e: pintar())
 
-def preparar_empresas():
-    conn = conectar()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(SQL_EMPRESAS)
-    finally:
-        conn.close()
+    # ───────────────────────── resumen ─────────────────────────
+    def renglon_res(nombre, valor, color=AZUL, negrita=False):
+        return ft.Row([ft.Text(nombre, size=15, expand=True, weight=ft.FontWeight.BOLD if negrita else None),
+                       ft.Text(valor, size=15, color=color, weight=ft.FontWeight.BOLD)])
 
+    def caja_res(titulo, filas):
+        return ft.Container(bgcolor="white", border_radius=12, padding=14,
+                            content=ft.Column([ft.Text(titulo, size=13, color=GRIS, weight=ft.FontWeight.BOLD),
+                                               ft.Divider(height=6)] + filas, spacing=6))
 
-def empresas(solo_activas=False):
-    conn = conectar()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(SQL_EMPRESAS)
-            cur.execute("SELECT * FROM ESTAC_EMPRESAS" + (" WHERE activo='1'" if solo_activas else "")
-                        + " ORDER BY nombre")
-            return list(cur.fetchall())
-    finally:
-        conn.close()
+    def pintar_resumen(d):
+        r = d["resumen"]
+        vista_resumen.controls = [
+            caja_res(f"CAJA · {d['titulo']}", [
+                renglon_res("💵 Efectivo", dinero(r["efectivo"]), VERDE),
+                renglon_res("💳 Tarjeta", dinero(r["tarjeta"]), AZUL),
+                renglon_res("📱 Transferencia", dinero(r["transferencia"]), MORADO),
+                ft.Divider(height=4),
+                renglon_res(f"TOTAL CAJA ({r['tickets_caja']} tickets)", dinero(r["caja"]), VERDE, True),
+            ]),
+            caja_res("POR TIPO (caja)", [
+                renglon_res(f"{tipo}  ({n})", dinero(imp), COLOR_TIPO.get(tipo, GRIS))
+                for tipo, (n, imp) in sorted(r["por_tipo"].items(), key=lambda kv: -kv[1][1])
+            ] or [ft.Text("Sin cobros en el periodo", color=GRIS)]),
+            caja_res("NO SUMAN A CAJA", [
+                renglon_res(f"🏨 Convenio hotel ({r['tickets_hotel']})", dinero(r["hotel"]), COLOR_TIPO["HOTEL"]),
+                renglon_res("🅿 Pensionados", f"{r['pensionados']} mov.", COLOR_TIPO["PENSIONADO"]),
+            ]),
+            caja_res("AHORITA ADENTRO", [
+                renglon_res(f"🚗 Vehículos ({r['adentro']})", dinero(r["adentro_estimado"]), NARANJA),
+                ft.Text("Lo que llevan acumulado si salieran en este momento.", size=11, color=GRIS),
+            ]),
+        ]
 
+    # ───────────────────────── pintar todo ─────────────────────────
+    tabs = ft.Tabs(selected_index=0, expand=1, animation_duration=150, tabs=[
+        ft.Tab(text="🚗 Adentro", content=lista_adentro),
+        ft.Tab(text="✅ Cobrados", content=lista_cobrados),
+        ft.Tab(text="📊 Resumen", content=vista_resumen),
+    ])
+    lb_periodo = ft.Text("", size=13, color="white")
+    lb_hora = ft.Text("", size=11, color="#C5CAE9")
 
-def guardar_empresa(datos, id_=None):
-    valores = [str(datos.get(c) or "").strip() for c in CAMPOS_EMPRESA]
-    valores[CAMPOS_EMPRESA.index("puerto")] = int(datos.get("puerto") or 3306)
-    valores[0] = valores[0].upper()
-    if not valores[0] or not datos.get("nombre"):
-        raise ValueError("La clave y el nombre son obligatorios.")
-    conn = conectar()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(SQL_EMPRESAS)
-            if id_:
-                cur.execute("UPDATE ESTAC_EMPRESAS SET " + ", ".join(f"{c}=%s" for c in CAMPOS_EMPRESA)
-                            + " WHERE id=%s", valores + [id_])
-            else:
-                cur.execute(f"INSERT INTO ESTAC_EMPRESAS ({', '.join(CAMPOS_EMPRESA)}) "
-                            f"VALUES ({', '.join(['%s'] * len(CAMPOS_EMPRESA))})", valores)
-    finally:
-        conn.close()
+    def pintar():
+        d = estado["datos"]
+        if not d:
+            return
+        filtro = (buscar.value or "").strip().upper()
+        dentro = [x for x in d["adentro"] if filtro in str(x.get("placas") or "").upper()]
+        fuera = [x for x in d["cobrados"] if filtro in str(x.get("placas") or "").upper()]
+        r = d["resumen"]
+        fila_tarjetas.controls = [
+            tarjeta("Total caja", dinero(r["caja"]), f"{r['tickets_caja']} tickets", VERDE),
+            tarjeta("Efectivo", dinero(r["efectivo"]), color=VERDE),
+            tarjeta("Tarjeta", dinero(r["tarjeta"]), color=AZUL),
+            tarjeta("Transferencia", dinero(r["transferencia"]), color=MORADO),
+            tarjeta("Adentro", f"{r['adentro']} autos", dinero(r["adentro_estimado"]) + " acumulado", NARANJA),
+            tarjeta("Convenio hotel", dinero(r["hotel"]), f"{r['tickets_hotel']} mov. · no es caja",
+                    COLOR_TIPO["HOTEL"]),
+        ]
+        lista_adentro.controls = [renglon_adentro(x) for x in dentro] or [
+            ft.Text("No hay vehículos adentro." if not filtro else "Sin coincidencias.", color=GRIS)]
+        lista_cobrados.controls = [renglon_cobrado(x) for x in fuera] or [
+            ft.Text("Sin cobros en el periodo." if not filtro else "Sin coincidencias.", color=GRIS)]
+        tabs.tabs[0].text = f"🚗 Adentro ({len(dentro)})"
+        tabs.tabs[1].text = f"✅ Cobrados ({len(fuera)})"
+        pintar_resumen(d)
+        ses = d["sesion"]
+        lb_periodo.value = d["titulo"] + (f"   ·   Turno abierto {ses['turno']:02d} ({ses['dia']})" if ses else "")
+        lb_hora.value = f"Actualizado {d['hora']:%H:%M:%S}"
+        page.update()
 
+    candado = threading.Lock()
 
-def borrar_empresa(id_):
-    conn = conectar()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM ESTAC_EMPRESAS WHERE id=%s", (id_,))
-    finally:
-        conn.close()
-
-
-def config_empresa(e):
-    """Conexión de una empresa; lo que venga vacío se toma de la base de control."""
-    cfg = config_mysql()
-    if (e.get("host") or "").strip():
-        cfg.update(host=e["host"].strip(), port=int(e.get("puerto") or 3306),
-                   user=e.get("usuario_db") or cfg["user"], password=e.get("clave_db") or "")
-    if (e.get("base") or "").strip():
-        cfg["database"] = e["base"].strip()
-    return cfg
-
-
-def probar_empresa(e):
-    """Regresa (ok, mensaje): conecta y revisa que existan las tablas del estacionamiento."""
-    try:
-        conn = conectar(config_empresa(e))
-    except Exception as ex:
-        return False, f"No conecta: {ex}"
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) n FROM enarma01 WHERE status='0'")
-            n = cur.fetchone()["n"]
-        return True, f"Conecta bien · {n} vehículos adentro"
-    except Exception as ex:
-        return False, f"Conecta, pero no encuentro enarma01 (¿ya sincronizó?): {ex}"
-    finally:
-        conn.close()
-
-
-def validar_usuario(usuario, clave):
-    """Empresas activas cuyo usuario/clave de la app coinciden."""
-    u = (usuario or "").strip().lower()
-    return [e for e in empresas(solo_activas=True)
-            if (e.get("usuario_app") or "").strip().lower() == u and (e.get("clave_app") or "") == clave]
-
-
-def num(v):
-    try:
-        return float(v or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def a_datetime(v):
-    if isinstance(v, datetime):
-        return v
-    if isinstance(v, date):
-        return datetime(v.year, v.month, v.day)
-    texto = str(v or "").strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    def _actualizar_pantalla():
         try:
-            return datetime.strptime(texto[:19], fmt)
-        except ValueError:
-            pass
-    return None
+            page.update()
+        except Exception as ex:               # la pantalla se desconectó: no importa, se reintenta luego
+            print(f"[cel] page.update falló: {ex}", flush=True)
 
+    def cargar(e=None, auto=False):
+        # el refresco automático se salta si ya hay una carga; lo demás (↻, periodo) espera hasta 20 s
+        if not (candado.acquire(blocking=False) if auto else candado.acquire(timeout=20)):
+            return
+        estado["ocupado"] = True
+        try:
+            barra.visible = True
+            _actualizar_pantalla()
+            estado["datos"] = dat.consultar(estado["modo"], estado["desde"], estado["hasta"],
+                                            estado["empresa"])
+            pintar()
+        except Exception as ex:
+            print(f"[cel] no pude leer la base: {ex}", flush=True)
+            try:
+                aviso(f"No pude leer la base: {ex}", True)
+            except Exception:
+                pass
+        finally:
+            barra.visible = False
+            estado["ocupado"] = False
+            candado.release()
+            _actualizar_pantalla()
 
-# ─────────────────────────────────────────────────────────────
-#  TARIFAS Y CÁLCULO (igual que estac_entra_sali_hotel.py)
-# ─────────────────────────────────────────────────────────────
-class Tarifas:
-    def __init__(self, hora=0, fraccion=0, dia=0, mediodia=0, hotel_dia=200.0, hotel_mediodia=150.0):
-        self.hora, self.fraccion = float(hora), float(fraccion)
-        self.dia, self.mediodia = float(dia), float(mediodia)
-        self.hotel_dia, self.hotel_mediodia = float(hotel_dia), float(hotel_mediodia)
+    # ───────────────────────── periodo ─────────────────────────
+    def elegir_fecha(cual):
+        def cambio(e):
+            if e.control.value:
+                estado[cual] = e.control.value.date()
+                bt_desde.text = f"Del {estado['desde']:%d/%m/%Y}"
+                bt_hasta.text = f"Al {estado['hasta']:%d/%m/%Y}"
+                cargar()
+        hoy = dat.ahora()
+        page.open(ft.DatePicker(first_date=hoy.replace(year=hoy.year - 5), last_date=hoy,
+                                value=datetime.combine(estado[cual], datetime.min.time()), on_change=cambio,
+                                help_text="Fecha", cancel_text="Cancelar", confirm_text="Aceptar"))
 
-    @classmethod
-    def leer(cls, cur):
-        t = cls()
-        cur.execute("SELECT codigo, hora, fraccion, dia, mediodia FROM ENARTA01 "
-                    "WHERE UPPER(TRIM(codigo)) IN ('0000', 'HT1')")
-        for r in cur.fetchall():
-            codigo = str(r["codigo"] or "").strip().upper()
-            if codigo == "0000":
-                t.hora, t.fraccion = num(r["hora"]), num(r["fraccion"])
-                t.dia, t.mediodia = num(r["dia"]), num(r["mediodia"])
-            elif codigo == "HT1":
-                t.hotel_dia = num(r["dia"]) or 200.0
-                t.hotel_mediodia = num(r["mediodia"]) or 150.0
-        return t
+    bt_desde = ft.OutlinedButton(f"Del {estado['desde']:%d/%m/%Y}", icon=ft.Icons.CALENDAR_MONTH,
+                                 on_click=lambda e: elegir_fecha("desde"))
+    bt_hasta = ft.OutlinedButton(f"Al {estado['hasta']:%d/%m/%Y}", icon=ft.Icons.CALENDAR_MONTH,
+                                 on_click=lambda e: elegir_fecha("hasta"))
+    fila_rango = ft.Row([bt_desde, bt_hasta], wrap=True, visible=False)
 
-    # --- cada modalidad ---
-    def normal(self, seg):
-        minutos = seg // 60
-        if minutos <= 60:
-            return self.hora
-        p = self.hora + ((minutos - 60) // 60 * self.hora)
-        if (minutos - 60) % 60 > 0:
-            p += self.fraccion
-        return p
+    def cambiar_modo(e):
+        estado["modo"] = periodo.value
+        fila_rango.visible = periodo.value == "rango"
+        cargar()
 
-    def excedente(self, seg):
-        """Después del bloque: por hora; lo que sobre hasta 30 min = media hora, más = hora."""
-        seg = max(0, int(seg))
-        if seg <= 0:
-            return 0.0
-        horas, resto = divmod(seg, 3600)
-        importe = horas * self.hora
-        if resto > 0:
-            importe += self.fraccion if resto <= 30 * 60 else self.hora
-        return float(importe)
+    periodo = ft.Dropdown(value="hoy", dense=True, bgcolor="white", border_radius=10, width=170,
+                          options=[ft.dropdown.Option("hoy", "Hoy"), ft.dropdown.Option("ayer", "Ayer"),
+                                   ft.dropdown.Option("turno", "Turno abierto"),
+                                   ft.dropdown.Option("rango", "Rango de fechas")],
+                          on_change=cambiar_modo)
 
-    def modalidad(self, seg, tipo):
-        if tipo == "MD":
-            return self.mediodia + self.excedente(seg - 12 * 3600)
-        return self.dia + self.excedente(seg - 24 * 3600)            # DIA
+    barra = ft.ProgressBar(visible=False, color=NARANJA, bgcolor="#C5CAE9")
 
-    def restaurante(self, seg):
-        return 0.0 if seg <= 2 * 3600 else self.excedente(seg - 2 * 3600)
+    lb_negocio = ft.Text(f"🅿 {NEGOCIO}", size=19, weight=ft.FontWeight.BOLD, color="white")
+    bt_empresas = ft.IconButton(ft.Icons.SWAP_HORIZ, icon_color="white", tooltip="Cambiar empresa",
+                                on_click=lambda e: elegir_empresa(), visible=False)
+    encabezado = ft.Container(
+        bgcolor=AZUL, padding=ft.padding.only(left=14, top=12, right=4, bottom=10),
+        content=ft.Row([
+            ft.Column([lb_negocio, lb_periodo, lb_hora], spacing=1, expand=True),
+            bt_empresas,
+            ft.IconButton(ft.Icons.REFRESH, icon_color="white", tooltip="Actualizar", on_click=cargar),
+            ft.IconButton(ft.Icons.LOGOUT, icon_color="white", tooltip="Salir", on_click=lambda e: salir()),
+        ], spacing=0))
 
-    def hotel(self, seg):
-        dias, resto = divmod(seg, 24 * 3600)
-        importe = dias * self.hotel_dia
-        if resto > 0:
-            importe += self.hotel_mediodia if resto <= 12 * 3600 + 15 * 60 else self.hotel_dia
-        elif dias == 0 and seg > 0:
-            importe = self.hotel_mediodia
-        return importe
+    cuerpo = ft.Column([
+        encabezado, barra,
+        ft.Container(padding=ft.padding.only(left=10, top=10, right=10, bottom=0), content=ft.Column([
+            ft.Row([periodo, buscar], spacing=8),
+            fila_rango,
+            fila_tarjetas,
+        ], spacing=8)),
+        tabs,
+    ], expand=True, spacing=0)
 
+    # ───────────────────────── entrar ─────────────────────────
+    def mostrar_app(empresa=None):
+        estado["empresa"] = empresa
+        estado["datos"] = None
+        page.session.set("empresa", empresa)
+        lb_negocio.value = f"🅿 {empresa['nombre'] if empresa else NEGOCIO}"
+        page.title = empresa["nombre"] if empresa else NEGOCIO
+        bt_empresas.visible = estado["admin"] or len(estado["opciones"]) > 1
+        hoy = dat.ahora(empresa.get("zona") if empresa else None).date()
+        estado.update(desde=hoy, hasta=hoy)
+        bt_desde.text, bt_hasta.text = f"Del {hoy:%d/%m/%Y}", f"Al {hoy:%d/%m/%Y}"
+        lista_adentro.controls.clear()
+        lista_cobrados.controls.clear()
+        vista_resumen.controls.clear()
+        fila_tarjetas.controls.clear()
+        page.controls.clear()
+        page.add(ft.SafeArea(cuerpo, expand=True))
+        cargar()
 
-def tiempo_txt(seg):
-    h, resto = divmod(max(0, int(seg)), 3600)
-    m, s = divmod(resto, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+        def refresco():                       # cada 30 s (el tiempo de los que están adentro avanza)
+            while estado["vivo"]:
+                time.sleep(CADA_SEGUNDOS)
+                if estado["vivo"] and estado["conectado"] and estado["datos"] is not None:
+                    try:
+                        cargar(auto=True)
+                    except Exception as ex:
+                        print(f"[cel] refresco: {ex}", flush=True)
+        if not estado["hilo"]:
+            estado["hilo"] = True
+            threading.Thread(target=refresco, daemon=True).start()
 
+    # Si el cel bloquea la pantalla o cambias de pestaña, se desconecta un rato: el refresco
+    # se pausa y al volver se actualiza de inmediato. Solo se apaga cuando la sesión se cierra.
+    def al_desconectar(e):
+        estado["conectado"] = False
 
-def tipo_de(r):
-    """Tipo para mostrar y su clave: NORMAL, MD, DIA, REST, HOTEL, PENSIONADO, BAÑO, SERVICIO."""
-    if "PENS:" in str(r.get("observaciones") or ""):
-        return "PENSIONADO"
-    t = str(r.get("tipo_servicio") or "").strip().upper()
-    return {"0000": "NORMAL", "": "NORMAL", "MD": "MEDIO DÍA", "DIA": "DÍA 24 H", "REST": "RESTAURANTE",
-            "HOTEL": "HOTEL", "PENSIONADO": "PENSIONADO", "BANO": "BAÑO"}.get(t, "SERVICIO")
+    def al_reconectar(e):
+        estado["conectado"] = True
+        if estado["datos"] is not None:
+            threading.Thread(target=cargar, kwargs={"auto": True}, daemon=True).start()
 
+    def al_cerrar(e):
+        estado["vivo"] = False
 
-def cobro_estimado(r, tarifas, momento=None):
-    """(tiempo, importe) de un vehículo que sigue adentro, como lo calcula la PC."""
-    entrada = a_datetime(r.get("fechae"))
-    if not entrada:
-        return "--", 0.0
-    seg = max(0, int(((momento or ahora()) - entrada).total_seconds()))
-    t = str(r.get("tipo_servicio") or "").strip().upper()
-    if "PENS:" in str(r.get("observaciones") or ""):
-        return tiempo_txt(seg), 0.0
-    if t == "HOTEL":
-        return tiempo_txt(seg), tarifas.hotel(seg)
-    if t in ("MD", "DIA"):
-        return tiempo_txt(seg), tarifas.modalidad(seg, t)
-    if t == "REST":
-        return tiempo_txt(seg), tarifas.restaurante(seg)
-    return tiempo_txt(seg), tarifas.normal(seg)
-
-
-# ─────────────────────────────────────────────────────────────
-#  CONSULTAS
-# ─────────────────────────────────────────────────────────────
-def sesion_actual(cur):
-    """{'dia': 'AAAA-MM-DD', 'turno': 1, 'cajero': '0001', 'clave': 'AAAA-MM-DD01'} o None."""
-    cur.execute("SELECT dia_trabajo, turno, cajero FROM ENARDI01 WHERE dia = '1900-01-01' LIMIT 1")
-    r = cur.fetchone()
-    if not r or not r.get("dia_trabajo"):
-        return None
-    dia = str(r["dia_trabajo"])[:10]
-    turno = int(num(r["turno"]))
-    return {"dia": dia, "turno": turno, "cajero": str(r.get("cajero") or ""), "clave": f"{dia}{turno:02d}"}
-
-
-def adentro(cur, tarifas):
-    cur.execute("""SELECT id, serie, folio, placas, fechae, turno, tipo_servicio, observaciones
-                   FROM enarma01 WHERE status = '0' ORDER BY fechae""")
-    momento = ahora()
-    res = []
-    for r in cur.fetchall():
-        tiempo, importe = cobro_estimado(r, tarifas, momento)
-        res.append(dict(r, tipo=tipo_de(r), tiempo=tiempo, importe=importe,
-                        folio_txt=f"{r.get('serie') or '00'}-{int(num(r.get('folio'))):06d}"))
-    return res
-
-
-def cobrados(cur, desde=None, hasta=None, turno=None):
-    """Cobrados (status '2') por rango de fechas de salida, o de un turno ('AAAA-MM-DD01')."""
-    campos = ("id, serie, folio, placas, tipo_servicio, observaciones, importe, efectivo, tarjeta, "
-              "transferencia, fechae, fechas, horas, tiempo, turno, cajero")
-    if turno:
-        cur.execute(f"SELECT {campos} FROM enarma01 WHERE status = '2' AND turno = %s "
-                    "ORDER BY fechas DESC, id DESC", (turno,))
-    else:
-        cur.execute(f"SELECT {campos} FROM enarma01 WHERE status = '2' AND fechas >= %s AND fechas < %s "
-                    "ORDER BY fechas DESC, id DESC",
-                    (datetime(desde.year, desde.month, desde.day),
-                     datetime(hasta.year, hasta.month, hasta.day) + timedelta(days=1)))
-    res = []
-    for r in cur.fetchall():
-        res.append(dict(r, tipo=tipo_de(r),
-                        folio_txt=f"{r.get('serie') or '00'}-{int(num(r.get('folio'))):06d}"))
-    return res
-
-
-def resumen(lista_cobrados, lista_adentro):
-    """Totales como estac_movimientos_hotel.py: hotel y pensionados NO suman a caja."""
-    r = {"caja": 0.0, "efectivo": 0.0, "tarjeta": 0.0, "transferencia": 0.0, "tickets_caja": 0,
-         "hotel": 0.0, "tickets_hotel": 0, "pensionados": 0, "por_tipo": {},
-         "adentro": len(lista_adentro), "adentro_estimado": sum(x["importe"] for x in lista_adentro)}
-    for x in lista_cobrados:
-        tipo = x["tipo"]
-        imp = num(x.get("importe"))
-        if tipo == "HOTEL":
-            r["hotel"] += imp
-            r["tickets_hotel"] += 1
-            continue
-        if tipo == "PENSIONADO":
-            r["pensionados"] += 1
-            continue
-        r["caja"] += imp
-        r["efectivo"] += num(x.get("efectivo"))
-        r["tarjeta"] += num(x.get("tarjeta"))
-        r["transferencia"] += num(x.get("transferencia"))
-        r["tickets_caja"] += 1
-        t = r["por_tipo"].setdefault(tipo, [0, 0.0])
-        t[0] += 1
-        t[1] += imp
-    return r
-
-
-def consultar(modo, desde=None, hasta=None, empresa=None):
-    """Todo lo de la pantalla en una sola conexión.
-    modo: 'hoy', 'ayer', 'turno' (turno abierto) o 'rango' (desde / hasta).
-    empresa: renglón de ESTAC_EMPRESAS (None = base de control)."""
-    token = _zona.set(zona_de(empresa.get("zona")) if empresa else ZONA)
+    page.on_disconnect = al_desconectar
+    page.on_connect = al_reconectar
     try:
-        return _consultar(modo, desde, hasta, config_empresa(empresa) if empresa else None)
-    finally:
-        _zona.reset(token)
+        page.on_close = al_cerrar
+    except Exception:
+        pass
 
+    def pantalla(contenido, ancho=340):
+        estado["datos"] = None                 # que el refresco no pinte encima
+        page.controls.clear()
+        page.add(ft.SafeArea(ft.Container(
+            alignment=ft.alignment.top_center, expand=True, padding=12,
+            content=ft.Container(width=ancho, bgcolor="white", border_radius=16, padding=20,
+                                 content=contenido)), expand=True))
+        page.update()
 
-def _consultar(modo, desde, hasta, cfg):
-    conn = conectar(cfg)
-    try:
-        with conn.cursor() as cur:
-            tarifas = Tarifas.leer(cur)
-            ses = sesion_actual(cur)
-            hoy = ahora().date()
-            if modo == "turno" and ses:
-                titulo = f"Turno {ses['turno']:02d} del {ses['dia']}"
-                lista = cobrados(cur, turno=ses["clave"])
+    def salir():
+        page.session.clear()
+        estado.update(admin=False, opciones=[], empresa=None, datos=None)
+        login()
+
+    # ─────────────── elegir empresa (admin o usuario con varias) ───────────────
+    def elegir_empresa():
+        try:
+            lista = dat.empresas(solo_activas=not estado["admin"]) if estado["admin"] else estado["opciones"]
+        except Exception as ex:
+            aviso(f"No pude leer las empresas: {ex}", True)
+            return
+        filas = []
+        for emp in lista:
+            activa = (emp.get("activo") or "1") == "1"
+            filas.append(ft.ListTile(
+                leading=ft.Icon(ft.Icons.LOCAL_PARKING, color=AZUL if activa else GRIS),
+                title=ft.Text(emp["nombre"], weight=ft.FontWeight.BOLD, color=None if activa else GRIS),
+                subtitle=ft.Text(f"{emp['clave']} · {emp.get('base') or 'base de control'}"
+                                 + ("" if activa else " · INACTIVA"), size=12),
+                trailing=ft.IconButton(ft.Icons.EDIT, tooltip="Editar",
+                                       on_click=lambda e, x=emp: editar_empresa(x)) if estado["admin"] else None,
+                on_click=lambda e, x=emp: mostrar_app(x)))
+        if estado["admin"]:
+            filas.append(ft.ListTile(leading=ft.Icon(ft.Icons.STORAGE, color=GRIS),
+                                     title=ft.Text("Base de control"),
+                                     subtitle=ft.Text("La de las variables de Railway", size=12),
+                                     on_click=lambda e: mostrar_app(None)))
+        pantalla(ft.Column([
+            ft.Row([ft.Text("Empresas", size=20, weight=ft.FontWeight.BOLD, color=AZUL, expand=True),
+                    ft.IconButton(ft.Icons.LOGOUT, tooltip="Salir", on_click=lambda e: salir())]),
+            ft.Text("Toca una para ver su estacionamiento.", color=GRIS, size=12),
+            ft.Column(filas or [ft.Text("Todavía no hay empresas.", color=GRIS)], spacing=0,
+                      scroll=ft.ScrollMode.AUTO),
+            ft.FilledButton("➕ Nueva empresa", on_click=lambda e: editar_empresa(None),
+                            visible=estado["admin"], width=300),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO), ancho=420)
+
+    # ─────────────── alta / cambio de empresa (solo admin) ───────────────
+    ZONAS = ["America/Merida", "America/Cancun", "America/Mexico_City", "America/Monterrey",
+             "America/Chihuahua", "America/Mazatlan", "America/Hermosillo", "America/Tijuana"]
+
+    def editar_empresa(emp):
+        emp = emp or {}
+        def campo(nombre, etiqueta, **kw):
+            return ft.TextField(label=etiqueta, value=str(emp.get(nombre) if emp.get(nombre) is not None else ""),
+                                dense=True, **kw)
+        c = {
+            "clave": campo("clave", "Clave (ej. EST01)", capitalization=ft.TextCapitalization.CHARACTERS),
+            "nombre": campo("nombre", "Nombre del estacionamiento"),
+            "host": campo("host", "Servidor MySQL (vacío = el de control)"),
+            "puerto": campo("puerto", "Puerto", keyboard_type=ft.KeyboardType.NUMBER),
+            "usuario_db": campo("usuario_db", "Usuario MySQL"),
+            "clave_db": campo("clave_db", "Contraseña MySQL", password=True, can_reveal_password=True),
+            "base": campo("base", "Base de datos sincronizada"),
+            "usuario_app": campo("usuario_app", "Usuario para entrar (el dueño)"),
+            "clave_app": campo("clave_app", "Contraseña para entrar", password=True, can_reveal_password=True),
+        }
+        if not c["puerto"].value:
+            c["puerto"].value = "3306"
+        dd_zona = ft.Dropdown(label="Zona horaria", dense=True, value=emp.get("zona") or ZONAS[0],
+                              options=[ft.dropdown.Option(z) for z in ZONAS])
+        sw_activo = ft.Switch(label="Activa", value=(emp.get("activo") or "1") == "1")
+        lb_prueba = ft.Text("", size=12)
+
+        def datos():
+            d = {k: v.value for k, v in c.items()}
+            d.update(zona=dd_zona.value, activo="1" if sw_activo.value else "0")
+            return d
+
+        def probar(e):
+            lb_prueba.value, lb_prueba.color = "Probando…", GRIS
+            page.update()
+            ok, msg = dat.probar_empresa(datos())
+            lb_prueba.value, lb_prueba.color = ("✅ " if ok else "❌ ") + msg, VERDE if ok else "#B71C1C"
+            page.update()
+
+        def guardar(e):
+            try:
+                dat.guardar_empresa(datos(), emp.get("id"))
+            except Exception as ex:
+                lb_prueba.value, lb_prueba.color = f"❌ {ex}", "#B71C1C"
+                page.update()
+                return
+            aviso("Empresa guardada.")
+            elegir_empresa()
+
+        def borrar(e):
+            def si(ev):
+                page.close(dlg)
+                dat.borrar_empresa(emp["id"])
+                aviso("Empresa borrada.")
+                elegir_empresa()
+            dlg = ft.AlertDialog(title=ft.Text("¿Borrar empresa?"),
+                                 content=ft.Text(f"{emp.get('nombre')} — solo se borra de la app, "
+                                                 "su base no se toca."),
+                                 actions=[ft.TextButton("Cancelar", on_click=lambda ev: page.close(dlg)),
+                                          ft.TextButton("Borrar", on_click=si)])
+            page.open(dlg)
+
+        pantalla(ft.Column([
+            ft.Text("Editar empresa" if emp else "Nueva empresa", size=20, weight=ft.FontWeight.BOLD, color=AZUL),
+            c["clave"], c["nombre"],
+            ft.Text("Conexión a su base sincronizada", size=12, color=GRIS, weight=ft.FontWeight.BOLD),
+            c["host"], c["puerto"], c["usuario_db"], c["clave_db"], c["base"],
+            ft.Text("Acceso del dueño", size=12, color=GRIS, weight=ft.FontWeight.BOLD),
+            c["usuario_app"], c["clave_app"], dd_zona, sw_activo, lb_prueba,
+            ft.Row([ft.OutlinedButton("Probar conexión", icon=ft.Icons.WIFI_TETHERING, on_click=probar),
+                    ft.FilledButton("Guardar", icon=ft.Icons.SAVE, on_click=guardar)], wrap=True),
+            ft.Row([ft.TextButton("← Regresar", on_click=lambda e: elegir_empresa()),
+                    ft.TextButton("Borrar", icon=ft.Icons.DELETE, icon_color="#B71C1C",
+                                  on_click=borrar, visible=bool(emp.get("id")))],
+                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ], spacing=10, scroll=ft.ScrollMode.AUTO), ancho=420)
+
+    # ─────────────── login ───────────────
+    def login():
+        tx_user = ft.TextField(label="Usuario", value="", autofocus=True, width=280)
+        tx_pass = ft.TextField(label="Contraseña", password=True, can_reveal_password=True, width=280)
+        lb_err = ft.Text("", color="#B71C1C")
+
+        def entrar(e):
+            usuario, clave = tx_user.value.strip(), tx_pass.value
+            if APP_CLAVE and usuario.lower() == APP_USUARIO.lower() and clave == APP_CLAVE:
+                estado["admin"] = True
+                page.session.set("admin", True)
+                elegir_empresa()
+                return
+            try:
+                encontradas = dat.validar_usuario(usuario, clave)
+            except Exception as ex:
+                encontradas = []
+                lb_err.value = f"No pude revisar: {ex}"
+            if len(encontradas) == 1:
+                estado["opciones"] = encontradas
+                mostrar_app(encontradas[0])
+            elif encontradas:
+                estado["opciones"] = encontradas
+                elegir_empresa()
             else:
-                if modo == "ayer":
-                    desde = hasta = hoy - timedelta(days=1)
-                elif modo == "rango" and desde and hasta:
-                    desde, hasta = min(desde, hasta), max(desde, hasta)
-                else:
-                    desde = hasta = hoy
-                titulo = (f"{desde:%d/%m/%Y}" if desde == hasta
-                          else f"{desde:%d/%m/%Y} al {hasta:%d/%m/%Y}")
-                lista = cobrados(cur, desde, hasta)
-            dentro = adentro(cur, tarifas)
-    finally:
-        conn.close()
-    return {"titulo": titulo, "sesion": ses, "adentro": dentro, "cobrados": lista,
-            "resumen": resumen(lista, dentro), "hora": ahora()}
+                lb_err.value = lb_err.value or "Usuario o contraseña incorrectos."
+                tx_pass.value = ""
+                page.update()
+                lb_err.value = ""
+
+        tx_pass.on_submit = entrar
+        pantalla(ft.Column([
+            ft.Text(f"🅿 {NEGOCIO}", size=22, weight=ft.FontWeight.BOLD, color=AZUL),
+            ft.Text("Consulta de caja y vehículos", color=GRIS),
+            tx_user, tx_pass, lb_err,
+            ft.FilledButton("Entrar", width=280, height=46, on_click=entrar),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=12))
+
+    # ─────────────── arranque ───────────────
+    try:
+        hay_empresas = bool(dat.empresas())
+    except Exception:
+        hay_empresas = False
+    if page.session.get("admin"):
+        estado["admin"] = True
+        elegir_empresa()
+    elif not APP_CLAVE and not hay_empresas:
+        mostrar_app(None)                      # como antes: una sola base, sin login
+    else:
+        login()
+
+
+# Servidor web (Railway): FastAPI + uvicorn escuchando en 0.0.0.0:$PORT
+try:
+    import flet_web.fastapi as flet_fastapi
+except ImportError:                      # versiones que lo exponen como flet.fastapi
+    import flet.fastapi as flet_fastapi
+
+app = flet_fastapi.app(main)
+
+if __name__ == "__main__":
+    import uvicorn
+    puerto = int(os.getenv("PORT", "8550"))
+    print(f"Estacionamiento cel escuchando en 0.0.0.0:{puerto}", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=puerto, proxy_headers=True, forwarded_allow_ips="*")
