@@ -14,6 +14,7 @@ no suman a caja.
 """
 import contextvars
 import os
+import re
 from datetime import date, datetime, timedelta
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
@@ -41,6 +42,33 @@ def ahora(zona=None):
 # ─────────────────────────────────────────────────────────────
 #  CONEXIÓN (variables de Railway)
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  MAYÚSCULAS / MINÚSCULAS
+#  MySQL en Windows guarda las tablas en minúsculas (enarma01) y la sincronizada en Railway
+#  (Linux) sí distingue: ENARMA01 ≠ enarma01. Este cursor busca cómo se llama de verdad
+#  cada tabla en esa base y cambia el nombre en la consulta, venga como venga.
+# ─────────────────────────────────────────────────────────────
+_TABLA = re.compile(r"\b(?:ENAR[A-Z]{2}\d{2}|ESTAC_EMPRESAS)\b", re.IGNORECASE)
+
+
+class CursorTablas(DictCursor):
+    def execute(self, query, args=None):
+        con = self.connection
+        mapa = getattr(con, "_mapa_tablas", None)
+        if mapa is None:
+            super().execute("SHOW TABLES")
+            mapa = {}
+            for r in self.fetchall():
+                nombre = list(r.values())[0]
+                mapa.setdefault(nombre.upper(), nombre)
+            con._mapa_tablas = mapa
+        if isinstance(query, str):
+            query = _TABLA.sub(lambda m: mapa.get(m.group(0).upper(), m.group(0)), query)
+            if query.lstrip().upper().startswith("CREATE TABLE"):
+                con._mapa_tablas = None            # que vuelva a leer los nombres
+        return super().execute(query, args)
+
+
 def config_mysql():
     """MYSQL_URL / DATABASE_URL (mysql://usuario:clave@host:puerto/base) o DB_HOST, DB_PORT,
     DB_USER, DB_PASSWORD, DB_NAME. En Railway: MYSQL_URL = ${{MySQL.MYSQL_URL}}."""
@@ -56,7 +84,7 @@ def config_mysql():
     if not datos["host"] or not datos["database"]:
         raise RuntimeError("Falta la conexión: pon MYSQL_URL (o DB_HOST, DB_USER, DB_PASSWORD, DB_NAME) "
                            "en las variables de Railway.")
-    return dict(datos, charset="utf8mb4", cursorclass=DictCursor, autocommit=True,
+    return dict(datos, charset="utf8mb4", cursorclass=CursorTablas, autocommit=True,
                 connect_timeout=10, read_timeout=30)
 
 
