@@ -32,7 +32,7 @@ import estac_datos as dat
 NEGOCIO = os.getenv("NEGOCIO", "Estacionamiento")
 APP_USUARIO = os.getenv("APP_USUARIO", "admin")
 APP_CLAVE = os.getenv("APP_CLAVE", "")
-CADA_SEGUNDOS = 30
+CADA_SEGUNDOS = max(5, int(os.getenv("REFRESCO_SEG", "15") or 15))   # cada cuánto se actualiza sola
 
 AZUL, VERDE, NARANJA, MORADO, GRIS = "#1A237E", "#2E7D32", "#E65100", "#6A1B9A", "#546E7A"
 COLOR_TIPO = {"NORMAL": "#1565C0", "MEDIO DÍA": "#00838F", "DÍA 24 H": "#00695C", "RESTAURANTE": "#AD1457",
